@@ -1,0 +1,254 @@
+# meta-model — example configuration
+# Copy to meta-model.toml and edit. Loaded by the server at startup.
+#
+# Schema is annotated below; final field set finalised in D.1.3
+# (config loader). Treat this as a structural sketch, not a frozen
+# contract.
+
+# ── Server ──────────────────────────────────────────────────────────
+[server]
+host = "127.0.0.1"
+port = 8400
+log_level = "info"            # debug | info | warning | error
+request_timeout_secs = 600    # full MoA wall-clock budget per request
+
+# F5 — readiness probe tuning. Single timing knob: probe interval ==
+# cache TTL. Lower = faster recovery surfacing but more upstream
+# traffic; higher = quieter but slower propagation of failure/recovery
+# state.
+#   /v1/health flips to HTTP 503 when ANY upstream is unhealthy.
+#   Body: {status, unhealthy_upstreams:[{name, reason}], version}.
+#   reason ∈ "down" (5xx/timeout/refused), "auth_failed" (401/403),
+#           "misconfigured" (4xx other than auth, malformed url).
+#   IMPORTANT: wire as **readiness**, not liveness. 503s on liveness
+#   would force pod restarts when the upstream is the problem.
+# health_probe_interval_sec = 15
+# health_probe_timeout_sec = 5
+
+# Auth: localhost is unauthenticated by default.
+# NOTE (D.1.4): bearer_token is parsed but NOT YET ENFORCED. Setting
+# it does nothing until D.5.1 (deploy) wires the auth dependency.
+# Treat the unset state as "anyone reachable on the bound interface
+# can call the server" until the wiring lands.
+# bearer_token = "..."
+
+# ── Optional features ──────────────────────────────────────────────
+# Voting ensembles (parallel YES/NO across upstreams) are off by
+# default. Some deployments use voting for small consensus checks;
+# most consumers do not need it. Enable explicitly to make `type = "voting"`
+# profiles callable.
+[features]
+voting = false
+
+# ── Upstreams ──────────────────────────────────────────────────────
+# Each upstream is one declared model endpoint. Profiles reference
+# upstreams by the table key (e.g. "primary").
+
+# Auth options per upstream (all optional):
+#   api_key             = "..."        # OpenAI-compatible: Authorization: Bearer <api_key>
+#   api_key_env         = "FOO_KEY"    # env override; if set + present, wins over api_key.
+#                                      # If env_var is unset at runtime, falls back to api_key.
+#   basic_auth_user     = "..."        # HTTP Basic auth (e.g. nginx-fronted vLLM)
+#   basic_auth_pass     = "..."        # literal basic-auth password
+#   basic_auth_pass_env = "FOO_PASS"   # OR read from env var; mutually exclusive with literal pass
+# Bearer-style (api_key/api_key_env) and basic_auth_* are mutually exclusive.
+
+# `modalities` declares what input shapes the upstream accepts. Default
+# is text-only; vision-capable backends declare ["text", "image"].
+# Future video/audio backends extend the list. The server aggregates
+# modalities per profile and exposes them in /v1/models capabilities.
+
+# Upstream table names are operator-defined slots. Use names that make
+# the profile roles obvious, such as primary, fast, reasoning, or
+# vision_primary. Replace `model_id`, `base_url`, and bearer details
+# with the endpoints available in your own environment. Vision endpoints
+# below are placeholders; operators wire their own multimodal endpoints
+# when they want image, video, or audio support.
+
+[upstreams.primary]
+model_id = "provider/primary-synthesizer"
+base_url = "http://spark:8000/v1"
+context = 49152
+max_output = 8192
+supports_thinking = true                          # capability: endpoint accepts chat_template_kwargs
+chat_template_kwargs = { enable_thinking = false } # actual kwargs passed; profile may override per-role
+modalities = ["text"]
+# api_key_env = "PRIMARY_API_KEY"
+
+[upstreams.fast]
+model_id = "provider/fast-generator"
+base_url = "http://spark:8000/v1"
+context = 32768
+max_output = 4096
+supports_thinking = true
+chat_template_kwargs = { enable_thinking = false }
+modalities = ["text"]
+
+[upstreams.reasoning]
+model_id = "your-reasoning-model"
+base_url = "http://spark:8000/v1"
+context = 32768
+max_output = 4096
+modalities = ["text"]
+# Some reasoning-first models expose auxiliary reasoning channels.
+# Without `include_reasoning=false`, internal channel content can leak
+# control tokens into structured fields like `tool_calls[i].function.name`,
+# causing the declared-tool check to demote the candidate. Keep such
+# upstream-specific compatibility switches server-owned here.
+request_overrides = { reasoning_effort = "low", include_reasoning = false }
+
+# PLACEHOLDER — replace with the real VL endpoint your operator runs.
+# F6: list this upstream in the top-level `[vision].endpoints` array
+# below to enable image input. Empty array → image input disabled
+# (server returns `vision_not_supported` 501 envelope).
+[upstreams.vision_primary]
+model_id = "your-vl-model-id"
+base_url = "http://spark:8000/v1"
+context = 32768
+max_output = 4096
+modalities = ["text", "image"]
+
+# Optional secondary VL endpoint for cascade fallback (#6 below).
+[upstreams.vision_secondary]
+model_id = "your-vl-secondary-model-id"
+base_url = "http://spark:8000/v1"
+context = 16384
+max_output = 2048
+modalities = ["text", "image"]
+
+# ── Profiles ───────────────────────────────────────────────────────
+# Profiles bind an ensemble + system prompt + policies to a name.
+# Clients select profiles via `x_meta_model.profile`.
+
+# Profile names below are illustrative. Choose whatever names your
+# clients reference via `x_meta_model.profile`. The meta-model does not
+# treat any name specially; profiles are configured purely by content.
+
+# F1 advertised-context budget knobs (MoA only):
+#
+#   advertised_context  → optional `int | null`. Forces a specific
+#                         max_model_len regardless of the formula.
+#                         Set when you know better than the defaults.
+#
+#   synth_prompt_overhead_tokens (default 256)
+#       Fixed scaffold of the synth template (system prompt + candidate
+#       framing). Raise if your synth prompt is unusually elaborate.
+#
+#   non_client_synth_reserve_tokens (default 1024)
+#       Variable server-added portion of the synth payload — drafts
+#       (~N×output_reserve) + tool schema + recent tool tail + capped
+#       authority context. Production MoA profiles with N≥3 generators
+#       at 4k+ output_reserve typically need ~8192. Tune empirically
+#       per workload; the default is conservative for small fixtures.
+#
+# Formula: max_model_len = synth.context − overhead − reserve − synth.max_output
+# Config load fails when this evaluates ≤ 0; raise a synthesizer with
+# a larger context window or shrink the reserves.
+
+# 1. cap_wrap — end-of-turn synthesis when tool budget hits
+[profiles."cap_wrap.v1"]
+type = "moa"
+generators = ["primary", "fast", "reasoning"]
+synthesizer = "primary"
+synthesis_mode = "merge"
+generator_temperature = 0.7
+synthesizer_temperature = 0.3
+# Production reserve for 3 generators of ~4k output each + tool tail
+# + authority context. Tune to your actual draft sizes.
+non_client_synth_reserve_tokens = 8192
+
+# 2. write_synth — content-kind file synthesis (code, prose)
+[profiles."write_synth.v1"]
+type = "moa"
+generators = ["primary", "fast", "reasoning"]
+synthesizer = "primary"
+synthesis_mode = "merge"
+generator_temperature = 0.4
+synthesizer_temperature = 0.2
+
+# 2b. write_synth.structured_docs — structured-document synthesis
+# (e.g. spec / planning / requirements documents); calmer temperatures
+# than free-form content.
+[profiles."write_synth.structured_docs.v1"]
+type = "moa"
+generators = ["primary", "fast", "reasoning"]
+synthesizer = "primary"
+synthesis_mode = "merge"
+generator_temperature = 0.4
+synthesizer_temperature = 0.2
+
+# 3. text_synth — short content arg polishing
+[profiles."text_synth.v1"]
+type = "moa"
+generators = ["primary", "fast", "reasoning"]
+synthesizer = "primary"
+synthesis_mode = "merge"
+generator_temperature = 0.4
+synthesizer_temperature = 0.2
+
+# 4. tool_chat — main agent decision turn (tools)
+#
+# F6: multimodal serving is server-level (top-level `[vision]` /
+# `[video]` / `[audio]` blocks below). Profiles do NOT opt into
+# multimodality — any request with non-text content gets routed
+# through the matching server-level cascade regardless of which
+# profile was selected. Profile generator lists are therefore
+# text-only here.
+[profiles."tool_chat.v1"]
+type = "moa"
+generators = ["primary", "fast", "reasoning"]
+synthesizer = "primary"
+synthesis_mode = "merge"
+generator_temperature = 0.7
+synthesizer_temperature = 0.3
+fastpath_on_agreement = true
+
+# 5. injection_check — optional voting profile (requires features.voting=true)
+[profiles."injection_check.v1"]
+type = "voting"
+upstreams = ["primary", "fast", "reasoning"]
+aggregation = "any_yes"
+failure_vote = "yes"
+temperature = 0.0
+max_tokens = 5
+
+# 6. judge — verdict-bearing judge calls. Cascade so that when the
+#    primary judge is down, the request rotates to the next upstream
+#    instead of bubbling the failure back to the client. The client
+#    parses the verdict; the meta-model only knows ChatCompletion
+#    shape (cascade rotates on 5xx, transport error, malformed JSON,
+#    or empty content with no tool_calls — never on verdict UNCLEAR /
+#    unparseable, those stay surface-specific).
+[profiles."judge.v1"]
+type = "cascade"
+upstreams = ["primary", "fast"]
+on_all_fail = "structured_502"  # uniform fail-open code for clients
+
+# ── F6: server-level multimodal cascades ───────────────────────────
+#
+# Three independent top-level blocks. Each is a ranked-priority list
+# of upstream names. On a multimodal request (image_url / video_url /
+# input_audio content parts), the server cascades through the matching
+# list and returns the first 2xx response. Empty list (or block
+# absent) → that modality is disabled; requests with that content type
+# get a typed `<modality>_not_supported` 501 envelope through the
+# normal OpenAI rails. Single-model transparency: any profile (model
+# field) accepts any modality the server has configured.
+
+[vision]
+endpoints = ["vision_primary", "vision_secondary"]
+
+[video]
+endpoints = []  # no video upstream → video input rejected with 501
+
+[audio]
+endpoints = []  # no audio upstream → audio input rejected with 501
+
+# ── Notes ──────────────────────────────────────────────────────────
+# - Verdict-bearing judges live in the calling client, not here. The
+#   meta-model exposes synthesis / voting / cascade primitives only;
+#   it does not orchestrate verdict surfaces.
+# - Profile names are versioned. Bump the version (".v2") for any
+#   shape-affecting change; old clients keep working against v1.
+# - All profile fields are validated at startup. Unknown fields are
+#   rejected with a clear error.
