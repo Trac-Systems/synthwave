@@ -1,6 +1,6 @@
 # Synthwave Meta-Model
 
-OpenAI-compatible Mixture-of-Agents service by **Markus Bopp, Trac Systems**.
+OpenAI-compatible Mixture-of-Agents service by **Trac Systems**.
 
 Synthwave exposes a normal `/v1` model API while internally routing each request through one of several operator-defined profiles: single-upstream passthrough, parallel fan-out with synthesis, fallback cascades, or voting. Clients can use it as a drop-in model endpoint; operators control the model fleet and profile behavior in TOML.
 
