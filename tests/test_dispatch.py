@@ -2152,3 +2152,66 @@ def test_text_only_response_unaffected_by_declared_check(loaded_config) -> None:
     # No demotions — header either absent or doesn't list undeclared_tool
     failed = r.headers.get("X-MetaModel-Failed-Generators", "")
     assert "undeclared_tool" not in failed
+
+
+# ── Context-fit backstop: cap output so generators don't 400 on context ──
+from meta_model.moa.dispatch import _cap_output_to_context, DEFAULT_SAFETY_MARGIN
+from meta_model.moa.compaction import estimate_messages_tokens
+
+
+def _one_msg(n_chars: int) -> list[dict[str, Any]]:
+    return [{"role": "user", "content": "x" * n_chars}]
+
+
+def test_cap_output_noop_when_it_fits() -> None:
+    body = {"max_tokens": 1000}
+    _cap_output_to_context(body, _one_msg(100), 0, 200_000)
+    assert body["max_tokens"] == 1000
+
+
+def test_cap_output_caps_so_prompt_plus_output_fits_context() -> None:
+    msgs = _one_msg(4000)
+    est = estimate_messages_tokens(msgs)
+    context = est + 700  # only ~700 tokens of room beyond the prompt
+    body = {"max_tokens": 5000}
+    _cap_output_to_context(body, msgs, 0, context)
+    assert body["max_tokens"] == context - est - DEFAULT_SAFETY_MARGIN
+    # The whole point: est(prompt) + output + margin == context (no 400).
+    assert est + body["max_tokens"] + DEFAULT_SAFETY_MARGIN == context
+
+
+def test_cap_output_handles_max_completion_tokens() -> None:
+    msgs = _one_msg(4000)
+    est = estimate_messages_tokens(msgs)
+    context = est + 700
+    body = {"max_completion_tokens": 5000}
+    _cap_output_to_context(body, msgs, 0, context)
+    assert body["max_completion_tokens"] == context - est - DEFAULT_SAFETY_MARGIN
+
+
+def test_cap_output_noop_when_no_output_budget_set() -> None:
+    body = {"temperature": 0.5}
+    _cap_output_to_context(body, _one_msg(100), 0, 1000)
+    assert "max_tokens" not in body and "max_completion_tokens" not in body
+
+
+def test_cap_output_floors_at_one_when_no_room() -> None:
+    msgs = _one_msg(4000)
+    est = estimate_messages_tokens(msgs)
+    body = {"max_tokens": 5000}
+    _cap_output_to_context(body, msgs, 0, est)  # context == prompt, ceiling negative
+    assert body["max_tokens"] == 1
+
+
+def test_cap_output_margin_scales_with_large_prompt() -> None:
+    # Near the context limit the margin must grow with the prompt (~3%)
+    # so per-tokenizer drift (heavy tool/template tokenization) can't push
+    # prompt + output past context.
+    msgs = _one_msg(200_000)
+    est = estimate_messages_tokens(msgs)
+    assert est // 32 > DEFAULT_SAFETY_MARGIN  # proportional term dominates
+    context = est + 3000
+    body = {"max_tokens": 5000}
+    _cap_output_to_context(body, msgs, 0, context)
+    assert body["max_tokens"] == context - est - (est // 32)
+    assert est + body["max_tokens"] + (est // 32) == context
