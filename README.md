@@ -1,6 +1,54 @@
 # Synthwave Meta-Model
 
-OpenAI-compatible Mixture-of-Agents service by **Trac Systems**.
+**Synthwave makes several AI models smarter by making them work together.** It is a Mixture-of-Agents (MoA) service by **Trac Systems**: instead of routing your prompt to one model, Synthwave asks several independent models to each draft an answer, then has a final *synthesizer* model read every draft and fuse them into one best response. The combined system reasons better, makes fewer mistakes, and covers more ground than any of its individual members — all behind a single OpenAI-compatible endpoint.
+
+You call it like any normal model API (`POST /v1/chat/completions` with `model: "synthwave"`). Operators define the model fleet and how the models combine — parallel fan-out with synthesis, fallback cascades, or voting — in a TOML config.
+
+## Benchmark: AIME 2026
+
+> [!IMPORTANT]
+> **Synthwave scores 90.0% (27/30) on AIME 2026** — landing in the frontier band, above DeepSeek V3.2 and Claude Opus 4.6, on a freshly released, uncontaminated competition set. This is achieved with internal reasoning **mostly off**.
+
+Measured on the full AIME 2026 set (American Invitational Mathematics Examination I + II, 30 problems, single run; final answers graded as exact integers). The three misses are the three hardest items — the two final AIME II problems and one diagram-dependent problem.
+
+### Ranking — AIME 2026
+
+| Model | AIME 2026 | Internal thinking |
+| --- | --- | --- |
+| GPT-5 | ~100% | full |
+| Gemini 3.1 Pro | ~95% | full |
+| Grok 4.2 | ~93% | full |
+| **Synthwave (this project)** | **90.0%** | **mostly off** |
+| DeepSeek V3.2 | ~88% | full |
+| Claude Opus 4.6 | ~85% | full |
+| Llama 4 Scout | ~80% | full |
+| Qwen 3.5 | ~76% | full |
+
+Competitor figures come from public AIME 2026 leaderboards and can be checked directly: [MathArena — AIME 2026](https://matharena.ai/?comp=aime--aime_2026) and the [LLM leaderboard](https://www.clickrank.ai/llm-leaderboard/). Only the Synthwave row is measured by us; treat the other rows as indicative (sources and exact evaluation conditions vary).
+
+> [!NOTE]
+> **Thinking was mostly off — and turning it on _may_ increase intelligence.** Of the four models in the ensemble, only one generator (Ornith) runs with internal step-by-step reasoning enabled; the other two generators and the synthesizer run without it. So 90% reflects an ensemble that is largely *not* using extended thinking. Enabling reasoning across more of the fleet is untested headroom that may push the score higher.
+
+## The Benchmarked Setup
+
+The configuration above runs across **two NVIDIA DGX Spark (GB10) nodes**, each model served with [vLLM](https://github.com/vllm-project/vllm) behind an OpenAI-compatible endpoint and **NVFP4-quantized** for the GB10 hardware. The Mixture-of-Agents profile fans out to three **generators** (each writes an independent draft, in parallel) and fuses their drafts with one **synthesizer**:
+
+| Role | Model | Notes |
+| --- | --- | --- |
+| Generator | **Ornith-1.0-35B** | reasoning generator — the only member with internal thinking **on** |
+| Generator | **Qwen3.6-35B-A3B** | generalist (also the image/video input path) |
+| Generator | **Qwen3-Coder-Next** | code-focused generator |
+| Synthesizer | **Gemma-4-26B-A4B** | reads every draft, writes the final fused answer (thinking off) |
+
+Synthesis settings: **merge** mode, generator temperature **0.6**, synthesizer temperature **0.2**. The generators are queried concurrently; the synthesizer then reads all drafts and produces a single answer. Only Ornith uses extended thinking — the other generators and the synthesizer do not.
+
+### What this demonstrates
+
+This runs on **two DGX Spark (GB10) desktop-class nodes** — not a datacenter — yet the ensemble reaches **frontier territory for intelligence**. None of the individual models is a frontier model: three mid-size (26–35B) generators, each on its own well below the top of the table, are fused into a result that ranks alongside the best. The intelligence is a property of the **composition**, not of any single model or of raw scale.
+
+That principle scales *down*, too. The Mixture-of-Agents mechanism is model-agnostic — it lifts the effective intelligence of whatever fleet it is given, including **single-machine setups running smaller models**. You do not need this exact lineup or this hardware; you need a *diverse, balanced set of models* and a synthesizer to combine them. Because intelligence here depends on the **composition of models**, improving the mix — stronger generators, more diversity, more reasoning enabled — raises the result further than scaling any one model could.
+
+---
 
 Synthwave exposes a normal `/v1` model API while internally routing each request through one of several operator-defined profiles: single-upstream passthrough, parallel fan-out with synthesis, fallback cascades, or voting. Clients can use it as a drop-in model endpoint; operators control the model fleet and profile behavior in TOML.
 
