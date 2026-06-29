@@ -66,6 +66,9 @@ from ..reasoning import (
 from ..reasoning import (
     reasoning_fallback_text as _reasoning_fallback_text,
 )
+from ..reasoning import (
+    strip_message_inband_reasoning as _strip_message_inband_reasoning,
+)
 from ..upstream import forward_chat_completion
 from .fanout import GeneratorSuccess, successes
 from .tools import (
@@ -227,6 +230,9 @@ def _extract_assistant_message(resp: dict[str, Any]) -> dict[str, Any] | None:
     msg = choices[0].get("message") if isinstance(choices[0], dict) else None
     if not isinstance(msg, dict):
         return None
+    # Strip in-band chain-of-thought from the candidate draft before it
+    # reaches the synthesizer / single-success / best-of return paths.
+    _strip_message_inband_reasoning(msg)
     return msg
 
 
