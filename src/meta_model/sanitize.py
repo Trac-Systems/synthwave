@@ -30,7 +30,7 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import Any
 
-from .reasoning import coerce_reasoning_into_content
+from .reasoning import coerce_reasoning_into_content, strip_message_inband_reasoning
 
 
 def sanitize_reasoning(
@@ -66,6 +66,7 @@ def sanitize_reasoning(
         # Finalized message path. Rescue first, then strip.
         msg = choice.get("message")
         if isinstance(msg, dict):
+            strip_message_inband_reasoning(msg)
             coerce_reasoning_into_content(msg)
             msg.pop("reasoning", None)
             msg.pop("reasoning_content", None)

@@ -28,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import os
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
@@ -118,7 +119,7 @@ def quorum_threshold(n: int) -> int:
 # Review r1 C-MED finding: gating must be deadline/grace based, not
 # pure count, AND the grace must reflect actual cluster latency
 # distribution, not aspirational fairness.
-DEFAULT_QUORUM_GRACE_SECS = 30.0
+DEFAULT_QUORUM_GRACE_SECS = float(os.environ.get("TK_MOA_QUORUM_GRACE_SECS") or 30.0)
 
 
 async def _gather_with_quorum(

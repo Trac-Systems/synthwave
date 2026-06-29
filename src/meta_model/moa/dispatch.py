@@ -278,10 +278,21 @@ async def _dispatch_moa(
     messages = list(request_body.get("messages") or [])
     tools_token_estimate = _estimate_tools_tokens(request_body.get("tools"))
     tokens_in = estimate_messages_tokens(messages)
+    # The client's requested output budget (`max_tokens`) is forwarded to
+    # every generator verbatim, so compaction MUST reserve at least that
+    # much output room — otherwise a trimmed prompt + the forwarded
+    # `max_tokens` can still exceed a generator's context and vLLM 400s it
+    # (`prompt + max_tokens > context`), silently dropping it from quorum.
+    # Reserve max(default, requested) so the prompt is sized for what we
+    # actually forward.
+    requested_out = request_body.get("max_tokens") or request_body.get("max_completion_tokens")
+    response_reserve = DEFAULT_RESPONSE_RESERVE
+    if isinstance(requested_out, int) and requested_out > response_reserve:
+        response_reserve = requested_out
     layout = compact_with_shared_tail(
         messages,
         generators_with_cfg,
-        response_reserve=DEFAULT_RESPONSE_RESERVE,
+        response_reserve=response_reserve,
         tools_token_estimate=tools_token_estimate,
         safety_margin=DEFAULT_SAFETY_MARGIN,
         image_max_active=multimodal_max_active,
@@ -326,6 +337,12 @@ async def _dispatch_moa(
         body["messages"] = gp.messages
         if profile.generator_temperature is not None:
             body["temperature"] = profile.generator_temperature
+        # Backstop: never forward prompt + max_tokens > this generator's
+        # context. Compaction (above) sizes the prompt to leave output
+        # room, but if its estimate ever drifts or under-trims, this caps
+        # the OUTPUT budget (never the prompt) so the generator stays IN
+        # quorum instead of being 400'd and silently dropped.
+        _cap_output_to_context(body, gp.messages, tools_token_estimate, gen_cfg.context)
         per_gen_bodies.append((gp.upstream_name, gen_cfg, prepare_upstream_body(body, gen_cfg)))
 
     # Fan out. Note fan_out's body is shared; we instead invoke each
@@ -890,6 +907,39 @@ def _estimate_tools_tokens(tools: Any) -> int:
     # bytes / 3 + small margin for the chat-template scaffolding around
     # each tool. Matches client-core's chat_with_tools_synth formula.
     return len(text) // 3 + 64
+
+
+def _cap_output_to_context(
+    body: dict[str, Any],
+    messages: list[dict[str, Any]],
+    tools_token_estimate: int,
+    context: int,
+) -> None:
+    """Cap `max_tokens` / `max_completion_tokens` in `body` so that
+    estimate(prompt) + output + safety_margin fits this generator's
+    `context`. Mutates `body` in place; no-op when no output budget is set
+    or it already fits.
+
+    Caps the OUTPUT, never the prompt — the prompt was already sized by
+    compaction. The token estimator over-counts by design, so the cap errs
+    toward leaving headroom. Floors at 1 so a prompt that fits the context
+    always yields at least some output rather than being dropped.
+    """
+    key = "max_tokens" if body.get("max_tokens") is not None else "max_completion_tokens"
+    out = body.get(key)
+    if not isinstance(out, int) or out <= 0:
+        return
+    est_prompt = estimate_messages_tokens(messages) + tools_token_estimate
+    # Margin absorbs tokenizer variance between our byte-based estimate and
+    # each model's REAL tokenizer — especially tool-schema / chat-template
+    # scaffolding, which some tokenizers (e.g. gemma4 with a thinking
+    # template) count far heavier than `bytes/3`. A flat margin is too
+    # tight near the context limit, so scale it with the prompt (~3%): the
+    # buffer grows with the content that can drift.
+    margin = max(DEFAULT_SAFETY_MARGIN, est_prompt // 32)
+    ceiling = context - est_prompt - margin
+    if ceiling < out:
+        body[key] = max(1, ceiling)
 
 
 # ── Cascade dispatch ────────────────────────────────────────────────
