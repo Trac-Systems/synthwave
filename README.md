@@ -1,6 +1,6 @@
 # Synthwave Meta-Model
 
-**Synthwave makes several AI models smarter by making them work together.** It is a Mixture-of-Agents (MoA) service by **Trac Systems**: instead of routing your prompt to one model, Synthwave asks several independent models to each draft an answer, then has a final *synthesizer* model read every draft and fuse them into one best response. The combined system reasons better, makes fewer mistakes, and covers more ground than any of its individual members — all behind a single OpenAI-compatible endpoint.
+**Synthwave makes several AI models smarter by making them work together.** It is a Mixture-of-Agents (MoA) self-hosted server by **Trac Systems** (you streamline multiple models into one single isntance): instead of routing your prompt to one model, Synthwave asks several independent models to each draft an answer, then has a final *synthesizer* model read every draft and fuse them into one best response. The combined system reasons better, makes fewer mistakes, and covers more ground than any of its individual members — all behind a single OpenAI-compatible endpoint.
 
 You call it like any normal model API (`POST /v1/chat/completions` with `model: "synthwave"`). Operators define the model fleet and how the models combine — parallel fan-out with synthesis, fallback cascades, or voting — in a TOML config.
 
