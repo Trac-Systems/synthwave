@@ -116,6 +116,27 @@ def prepare_upstream_body(body: dict[str, Any], upstream: UpstreamConfig) -> dic
     if upstream.request_overrides:
         out.update(upstream.request_overrides)
     out["model"] = upstream.model_id
+
+    if upstream.protocol != "openai":
+        # Non-OpenAI protocols own their own wire translation (system
+        # extraction, thinking, image blocks) in their provider adapter.
+        # The vLLM-specific shims below (chat_template_kwargs, leading-
+        # system demotion, reasoning-model param renames) don't apply.
+        out.pop("chat_template_kwargs", None)
+        return out
+
+    # OpenAI reasoning-model normalization (opt-in via the [openai] block).
+    oai = upstream.openai
+    if oai is not None:
+        if oai.reasoning_effort is not None:
+            out["reasoning_effort"] = oai.reasoning_effort
+        if oai.max_tokens_param == "max_completion_tokens" and "max_tokens" in out:
+            # Reasoning models reject `max_tokens`; carry the caller's
+            # output budget under the field the model accepts.
+            out["max_completion_tokens"] = out.pop("max_tokens")
+        for param in oai.drop_params:
+            out.pop(param, None)
+
     if upstream.supports_thinking and upstream.chat_template_kwargs:
         out["chat_template_kwargs"] = dict(upstream.chat_template_kwargs)
     else:
@@ -140,7 +161,21 @@ async def forward_chat_completion(
 
     `transport` is an injection point for tests using
     `httpx.MockTransport`.
+
+    Non-"openai" upstreams are delegated to their provider adapter,
+    which speaks the backend's native wire protocol and returns a
+    synthetic OpenAI-shaped `httpx.Response` so every caller here is
+    protocol-agnostic.
     """
+    if upstream.protocol == "anthropic":
+        # Imported lazily to keep the default (OpenAI) path free of the
+        # provider package and avoid any import cycle.
+        from .providers.anthropic import forward_anthropic_messages
+
+        return await forward_anthropic_messages(
+            upstream, body, timeout_secs=timeout_secs, transport=transport
+        )
+
     upstream_body = prepare_upstream_body(body, upstream)
     headers = {"Content-Type": "application/json", **_build_auth_headers(upstream)}
     url = upstream.base_url.rstrip("/") + CHAT_COMPLETIONS_PATH

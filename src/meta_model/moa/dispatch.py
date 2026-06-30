@@ -1402,6 +1402,218 @@ async def _multimodal_cascade(
     )
 
 
+# ── 2-stage vision (describe → MoA) ─────────────────────────────────
+
+
+def _flatten_text_content(content: Any) -> str:
+    """Flatten OpenAI content (str | parts list) to plain text.
+
+    Text parts are concatenated; non-text parts (images) are dropped.
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        out: list[str] = []
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "text":
+                t = part.get("text")
+                if isinstance(t, str):
+                    out.append(t)
+        return "\n".join(out)
+    return ""
+
+
+def _message_has_image(msg: dict[str, Any]) -> bool:
+    content = msg.get("content")
+    if not isinstance(content, list):
+        return False
+    return any(isinstance(p, dict) and p.get("type") == "image_url" for p in content)
+
+
+def _collect_image_parts(messages: list[Any], cap: int) -> list[dict[str, Any]]:
+    """Gather up to ``cap`` most-recent ``image_url`` parts across messages."""
+    parts: list[dict[str, Any]] = []
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "image_url":
+                parts.append(part)
+    if cap > 0 and len(parts) > cap:
+        parts = parts[-cap:]
+    return parts
+
+
+def _latest_user_text(messages: list[Any]) -> str:
+    for msg in reversed(messages):
+        if isinstance(msg, dict) and msg.get("role") == "user":
+            text = _flatten_text_content(msg.get("content"))
+            if text.strip():
+                return text.strip()
+    return ""
+
+
+def _first_choice_text(payload: dict[str, Any] | None) -> str:
+    """Best-effort assistant text from a chat-completion payload."""
+    if not isinstance(payload, dict):
+        return ""
+    choices = payload.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return ""
+    first = choices[0]
+    msg = first.get("message") if isinstance(first, dict) else None
+    if not isinstance(msg, dict):
+        return ""
+    content = msg.get("content")
+    if isinstance(content, str) and content.strip():
+        return content
+    # Fall back to reasoning_content if the model split it out.
+    rc = msg.get("reasoning_content")
+    if isinstance(rc, str) and rc.strip():
+        return rc
+    return _flatten_text_content(content)
+
+
+def _build_describe_body(request_body: dict[str, Any], cfg: MetaModelConfig) -> dict[str, Any]:
+    """Stage-1 body: ask a vision upstream to transcribe the image(s).
+
+    Builds an isolated 2-message request (system describe-instruction +
+    one user turn carrying the image parts and the user's question for
+    targeting). Omits tools / response_format so the upstream returns
+    free-text, never a tool call.
+    """
+    messages = request_body.get("messages") or []
+    image_parts = _collect_image_parts(messages, cfg.vision.describe_image_cap)
+    user_text = _latest_user_text(messages)
+    targeting = (
+        f"\n\nFor context, the user's request is: {user_text!r}. Describe "
+        "everything relevant to it, but do NOT answer it."
+        if user_text
+        else ""
+    )
+    user_content: list[dict[str, Any]] = list(image_parts)
+    user_content.append(
+        {
+            "type": "text",
+            "text": "Describe the attached image(s) per your instructions." + targeting,
+        }
+    )
+    return {
+        "messages": [
+            {"role": "system", "content": cfg.vision.describe_prompt},
+            {"role": "user", "content": user_content},
+        ],
+        "max_tokens": cfg.vision.describe_max_tokens,
+        "temperature": cfg.vision.describe_temperature,
+        "stream": False,
+    }
+
+
+def _replace_images_with_description(
+    request_body: dict[str, Any], description: str
+) -> dict[str, Any]:
+    """Stage-2 body: strip image parts, inject the description as text.
+
+    The description is appended to the most-recent image-bearing message;
+    earlier image-bearing messages keep their text with a placeholder
+    note. All other fields (tools, response_format, temperature, stream)
+    pass through unchanged so the MoA answer honors the client contract.
+    """
+    messages = request_body.get("messages") or []
+    img_idxs = [
+        i for i, m in enumerate(messages) if isinstance(m, dict) and _message_has_image(m)
+    ]
+    last_img = img_idxs[-1] if img_idxs else None
+    new_messages: list[Any] = []
+    for i, msg in enumerate(messages):
+        if not isinstance(msg, dict) or not _message_has_image(msg):
+            new_messages.append(msg)
+            continue
+        text = _flatten_text_content(msg.get("content"))
+        if i == last_img:
+            block = (
+                "\n\n[Attached image(s), transcribed by the vision stage:\n"
+                f"{description}\n]"
+            )
+        else:
+            block = "\n\n[an image here was transcribed in a later message]"
+        new_msg = dict(msg)
+        new_msg["content"] = (text + block).strip()
+        new_messages.append(new_msg)
+    body = dict(request_body)
+    body["messages"] = new_messages
+    return body
+
+
+async def _vision_describe_then_moa(
+    profile: MoaProfile,
+    profile_name: str,
+    cfg: MetaModelConfig,
+    request_body: dict[str, Any],
+    *,
+    timeout_secs: float,
+    transport: httpx.AsyncBaseTransport | None,
+) -> DispatchResult:
+    """2-stage vision: transcribe via a vision upstream, then MoA over text.
+
+    Stage 1 sends the image(s) to the ``[vision].endpoints`` cascade with
+    a transcription instruction. Stage 2 replaces the image parts with the
+    returned text and runs the normal MoA fan-out + synthesis. On a
+    stage-1 failure (no usable description) it falls back to the
+    single-model cascade so 2-stage never degrades below prior behavior.
+    """
+    t0 = time.monotonic()
+    stage1_budget = min(timeout_secs * 0.5, 120.0)
+    describe_body = _build_describe_body(request_body, cfg)
+    stage1 = await _multimodal_cascade(
+        cfg.vision.endpoints,
+        cfg,
+        describe_body,
+        kind="vision",
+        profile_name=profile_name,
+        timeout_secs=stage1_budget,
+        transport=transport,
+    )
+    description = _first_choice_text(stage1.payload) if stage1.error is None else ""
+    if not description.strip():
+        # Stage-1 produced nothing usable — fall back to the single-model
+        # cascade (prior behavior) so vision still answers.
+        log.warning(
+            "vision 2-stage: stage-1 describe yielded no text (err=%s) — "
+            "falling back to single-model cascade",
+            stage1.error,
+        )
+        return await _multimodal_cascade(
+            cfg.vision.endpoints,
+            cfg,
+            request_body,
+            kind="vision",
+            profile_name=profile_name,
+            timeout_secs=max(timeout_secs - (time.monotonic() - t0), 1.0),
+            transport=transport,
+        )
+
+    stage2_body = _replace_images_with_description(request_body, description)
+    stage2_modality = detect_message_modality(stage2_body.get("messages") or [])
+    remaining = max(timeout_secs - (time.monotonic() - t0), 1.0)
+    result = await _dispatch_moa(
+        profile,
+        profile_name,
+        cfg,
+        stage2_body,
+        modality=stage2_modality,
+        timeout_secs=remaining,
+        transport=transport,
+    )
+    # Observability: tag the 2-stage path + describe length.
+    result.headers.setdefault("X-MetaModel-Vision-Path", "describe_then_moa")
+    result.headers.setdefault("X-MetaModel-Vision-Describe-Chars", str(len(description)))
+    return result
+
+
 # ── Top-level entry ─────────────────────────────────────────────────
 
 
@@ -1486,6 +1698,16 @@ async def dispatch(
     if modality.has_images:
         if not cfg.vision.endpoints:
             return _missing_capability_err("vision")
+        # 2-stage describe→MoA (opt-in). A vision upstream transcribes the
+        # image(s) to text, then the normal MoA fan-out + synthesis runs
+        # over the text so the whole ensemble reasons about the screenshot.
+        # Only when enabled AND the resolved profile is MoA; otherwise fall
+        # through to the single-model cascade (prior behavior).
+        if cfg.vision.two_stage and isinstance(profile, MoaProfile):
+            return await _vision_describe_then_moa(
+                profile, resolved_name, cfg, request_body,
+                timeout_secs=timeout_secs, transport=transport,
+            )
         return await _multimodal_cascade(
             cfg.vision.endpoints, cfg, request_body,
             kind="vision", profile_name=resolved_name,

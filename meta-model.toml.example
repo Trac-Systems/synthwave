@@ -116,6 +116,52 @@ context = 16384
 max_output = 2048
 modalities = ["text", "image"]
 
+# ── Cloud provider protocols (optional) ────────────────────────────
+# Every upstream above speaks the default `protocol = "openai"` wire
+# format (OpenAI-compatible /chat/completions, e.g. vLLM). Two opt-in
+# extras let an upstream be a hosted cloud model instead — mix them with
+# local upstreams in the same MoA ensemble. Both are off by default, so
+# existing configs are unaffected.
+#
+# (1) OpenAI *reasoning* models (gpt-5.x / o-series). Same wire format,
+# but they require `max_completion_tokens` instead of `max_tokens`, 400
+# on a non-default temperature, and take a `reasoning_effort` knob. The
+# optional [upstreams.<name>.openai] block normalizes all three:
+#
+# [upstreams.gpt]
+# model_id = "gpt-5.5"
+# base_url = "https://api.openai.com/v1"
+# context = 400000
+# max_output = 16000
+# modalities = ["text", "image"]
+# api_key_env = "OPENAI_API_KEY"
+# [upstreams.gpt.openai]
+# reasoning_effort = "high"                 # none|minimal|low|medium|high|xhigh (subset varies by model; none/minimal = thinking-off)
+# max_tokens_param = "max_completion_tokens"
+# drop_params = ["temperature", "top_p"]    # params the model rejects
+#
+# (2) Anthropic models via the native Messages API. `protocol =
+# "anthropic"` routes through the Messages adapter (system extraction,
+# image blocks, tool calling, and extended-thinking/effort — none of
+# which survive Anthropic's OpenAI-compat shim). Auth uses the same
+# api_key/api_key_env fields (sent as x-api-key). The optional
+# [upstreams.<name>.anthropic] block controls thinking:
+#
+# [upstreams.opus]
+# model_id = "claude-opus-4-8"
+# base_url = "https://api.anthropic.com/v1"
+# context = 200000
+# max_output = 32000
+# modalities = ["text", "image"]
+# supports_thinking = true
+# protocol = "anthropic"
+# api_key_env = "ANTHROPIC_API_KEY"
+# [upstreams.opus.anthropic]
+# version = "2023-06-01"                     # anthropic-version header
+# thinking = "adaptive"                      # adaptive|enabled|off
+# effort = "xhigh"                           # output_config.effort (adaptive)
+# # budget_tokens = 8000                     # only for thinking = "enabled"
+
 # ── Profiles ───────────────────────────────────────────────────────
 # Profiles bind an ensemble + system prompt + policies to a name.
 # Clients select profiles via `x_meta_model.profile`.
