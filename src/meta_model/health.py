@@ -135,7 +135,14 @@ async def probe_upstream(
     # the env var isn't set at runtime). Wrap so the function
     # honors its "Never raises" contract.
     try:
-        headers = _build_auth_headers(upstream)
+        if upstream.protocol == "anthropic":
+            # Anthropic rejects Bearer auth; its catalog probe needs
+            # x-api-key + anthropic-version (same scheme the adapter uses).
+            from .providers.anthropic import build_auth_headers as _anthropic_auth_headers
+
+            headers = _anthropic_auth_headers(upstream)
+        else:
+            headers = _build_auth_headers(upstream)
     except Exception as exc:  # noqa: BLE001 — defense in depth
         return UpstreamHealth(
             state="misconfigured",

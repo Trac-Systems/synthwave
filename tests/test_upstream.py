@@ -9,7 +9,7 @@ leave the leading system message untouched.
 
 from __future__ import annotations
 
-from meta_model.config import UpstreamConfig
+from meta_model.config import AnthropicOptions, OpenAIOptions, UpstreamConfig
 from meta_model.upstream import _demote_non_leading_system_messages, prepare_upstream_body
 
 
@@ -160,3 +160,85 @@ def test_prepare_upstream_body_does_not_mutate_input() -> None:
     snapshot = [dict(m) for m in body["messages"]]
     prepare_upstream_body(body, _up(requires_leading_system_only=True))
     assert body["messages"] == snapshot
+
+
+# ── OpenAI reasoning-model normalization (opt-in [openai] block) ─────
+
+
+def _oai_up(openai: OpenAIOptions) -> UpstreamConfig:
+    return UpstreamConfig(
+        model_id="gpt-5.5",
+        base_url="https://api.openai.com/v1",
+        context=400000,
+        max_output=16000,
+        openai=openai,
+    )
+
+
+def test_openai_reasoning_effort_injected() -> None:
+    body = {"model": "client", "messages": [], "max_tokens": 100}
+    out = prepare_upstream_body(body, _oai_up(OpenAIOptions(reasoning_effort="xhigh")))
+    assert out["reasoning_effort"] == "xhigh"
+    assert out["model"] == "gpt-5.5"
+
+
+def test_openai_renames_max_tokens_to_max_completion_tokens() -> None:
+    body = {"model": "client", "messages": [], "max_tokens": 256}
+    out = prepare_upstream_body(
+        body, _oai_up(OpenAIOptions(max_tokens_param="max_completion_tokens"))
+    )
+    assert "max_tokens" not in out
+    assert out["max_completion_tokens"] == 256
+
+
+def test_openai_drops_unsupported_sampling_params() -> None:
+    body = {"model": "client", "messages": [], "temperature": 0.6, "top_p": 0.9}
+    out = prepare_upstream_body(body, _oai_up(OpenAIOptions(drop_params=["temperature", "top_p"])))
+    assert "temperature" not in out
+    assert "top_p" not in out
+
+
+def test_openai_block_absent_is_byte_identical_passthrough() -> None:
+    """No [openai] block → behaves exactly like a vanilla upstream."""
+    body = {"model": "client", "messages": [], "max_tokens": 100, "temperature": 0.5}
+    out = prepare_upstream_body(body, _oai_up_none())
+    assert out["max_tokens"] == 100
+    assert out["temperature"] == 0.5
+    assert "reasoning_effort" not in out
+
+
+def _oai_up_none() -> UpstreamConfig:
+    return UpstreamConfig(
+        model_id="vllm-model",
+        base_url="http://x",
+        context=4096,
+        max_output=128,
+    )
+
+
+def test_anthropic_protocol_skips_vllm_shims() -> None:
+    """Anthropic-protocol upstreams keep their messages untouched here
+    (the adapter owns system handling) and never get reasoning renames."""
+    up = UpstreamConfig(
+        model_id="claude-opus-4-8",
+        base_url="https://api.anthropic.com/v1",
+        context=200000,
+        max_output=8192,
+        protocol="anthropic",
+        anthropic=AnthropicOptions(thinking="adaptive", effort="xhigh"),
+        requires_leading_system_only=True,  # must be ignored on this path
+    )
+    body = {
+        "model": "client",
+        "max_tokens": 100,
+        "messages": [
+            {"role": "system", "content": "a"},
+            {"role": "user", "content": "hi"},
+            {"role": "system", "content": "b"},
+        ],
+    }
+    out = prepare_upstream_body(body, up)
+    assert out["model"] == "claude-opus-4-8"
+    # No demotion applied — the second system message is still a system role.
+    assert out["messages"][2]["role"] == "system"
+    assert out["max_tokens"] == 100  # untouched (adapter handles the rename)

@@ -92,6 +92,65 @@ class FeaturesConfig(BaseModel):
 Modality = Literal["text", "image", "video", "audio"]
 
 
+# ── Provider transport protocols ────────────────────────────────────
+#
+# An upstream's `protocol` selects which wire format the upstream client
+# speaks. "openai" (default) is the OpenAI/vLLM `/chat/completions`
+# contract synthwave has always emitted. "anthropic" routes through the
+# Anthropic Messages (`/v1/messages`) adapter in `providers.anthropic`,
+# which translates synthwave's internal OpenAI request/response shape
+# to and from Anthropic's — so a Claude model can be an MoA generator or
+# the synthesizer transparently. The optional per-protocol option blocks
+# below carry the knobs that don't exist in the other protocol.
+
+ProviderProtocol = Literal["openai", "anthropic"]
+
+
+class OpenAIOptions(BaseModel):
+    """Per-upstream knobs for the OpenAI `/chat/completions` protocol.
+
+    Needed for OpenAI's *reasoning* models (the gpt-5.x / o-series
+    family), which reject the vLLM-style request shape synthwave emits
+    by default: they require `max_completion_tokens` instead of
+    `max_tokens`, 400 on a non-default `temperature`, and take a
+    `reasoning_effort` knob. None of this applies to a plain
+    OpenAI-compatible vLLM upstream, so it is all opt-in and empty by
+    default (byte-identical passthrough)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    # Different OpenAI reasoning models accept different subsets (e.g.
+    # gpt-5-mini: minimal..high; gpt-5.4-nano: none..xhigh). Allow the full
+    # known union and let the upstream API reject anything unsupported.
+    # "none"/"minimal" run the model effectively thinking-off.
+    reasoning_effort: Literal["none", "minimal", "low", "medium", "high", "xhigh"] | None = None
+    # Reasoning models reject `max_tokens`; set "max_completion_tokens"
+    # to rename the caller's output-budget field on the way out.
+    max_tokens_param: Literal["max_tokens", "max_completion_tokens"] = "max_tokens"
+    # Sampling params the model rejects (reasoning models 400 on a
+    # non-default `temperature` / `top_p`). Dropped from the body before
+    # forwarding. Typical for gpt-5.x reasoning: ["temperature", "top_p"].
+    drop_params: list[str] = Field(default_factory=list)
+
+
+class AnthropicOptions(BaseModel):
+    """Per-upstream knobs for the Anthropic Messages (`/v1/messages`)
+    protocol.
+
+    `thinking="adaptive"` is the Claude-Opus-4.x extended-thinking knob
+    (the model decides how much to think, bounded by `effort` →
+    `output_config.effort`). `thinking="enabled"` is the legacy
+    fixed-budget mode (needs `budget_tokens`). `None`/`"off"` disables
+    thinking. `version` is the `anthropic-version` header."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    version: str = "2023-06-01"
+    thinking: Literal["adaptive", "enabled", "off"] | None = None
+    effort: Literal["low", "medium", "high", "xhigh"] | None = None
+    budget_tokens: int | None = Field(default=None, gt=0)
+
+
 class UpstreamConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -129,6 +188,13 @@ class UpstreamConfig(BaseModel):
     # planning their request shape know exactly what's accepted.
     modalities: list[Modality] = Field(default_factory=lambda: ["text"])
     supports_function_calling: bool = True
+    # Wire protocol the upstream client speaks. Default "openai" is the
+    # unchanged OpenAI/vLLM `/chat/completions` path (byte-identical
+    # passthrough). "anthropic" routes through the Anthropic Messages
+    # adapter. The matching option block below is optional.
+    protocol: ProviderProtocol = "openai"
+    openai: OpenAIOptions | None = None
+    anthropic: AnthropicOptions | None = None
     api_key: str | None = None
     api_key_env: str | None = None
     basic_auth_user: str | None = None
@@ -176,6 +242,24 @@ class UpstreamConfig(BaseModel):
                 "upstream basic_auth password specified twice "
                 "(set basic_auth_pass OR basic_auth_pass_env, not both)"
             )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_protocol_options(self) -> UpstreamConfig:
+        """An option block must match the selected protocol, so a typo'd
+        protocol or a misplaced block fails loudly at config load rather
+        than silently no-op'ing at request time."""
+        if self.protocol == "anthropic":
+            if self.openai is not None:
+                raise ValueError(
+                    "upstream protocol='anthropic' must not set an [openai] options block"
+                )
+        else:  # "openai"
+            if self.anthropic is not None:
+                raise ValueError(
+                    f"upstream protocol={self.protocol!r} must not set an "
+                    f"[anthropic] options block"
+                )
         return self
 
     def resolved_api_key(self) -> str | None:
@@ -232,7 +316,33 @@ class _ModalityEndpointsConfig(BaseModel):
 
 
 class VisionConfig(_ModalityEndpointsConfig):
-    """Image-capable upstream cascade. Empty → image input disabled."""
+    """Image-capable upstream cascade. Empty → image input disabled.
+
+    ``two_stage`` (opt-in) upgrades image handling from single-model
+    passthrough to a describe→MoA pipeline: a vision upstream first
+    transcribes the image(s) to rich text, then the image parts are
+    replaced by that text and the normal MoA fan-out + synthesis runs
+    over it — so the ensemble's reasoning applies to screenshots, not
+    just the lone vision model. Only engages when the resolved profile
+    is MoA; otherwise (and when false, the default) image requests use
+    the single-model cascade exactly as before.
+    """
+
+    two_stage: bool = False
+    describe_prompt: str = (
+        "You are the vision-transcription stage of a multi-model pipeline. "
+        "Transcribe and describe the provided image(s) in exhaustive, faithful "
+        "detail so a text-only model can fully reason about them. Include every "
+        "piece of visible text VERBATIM (preserve code, numbers, labels, and "
+        "error messages exactly), the UI/layout structure, any tables or charts "
+        "(give the underlying values), diagrams, and visually significant state. "
+        "Do NOT answer or interpret the user's underlying question — output only "
+        "the description. Be thorough and factual; never speculate beyond what is "
+        "visible."
+    )
+    describe_max_tokens: int = 1500
+    describe_temperature: float = 0.2
+    describe_image_cap: int = 4
 
 
 class VideoConfig(_ModalityEndpointsConfig):

@@ -635,3 +635,90 @@ def test_f6_profile_capabilities_no_longer_carries_multimodal_fields() -> None:
     assert not hasattr(caps, "supports_image_tools")
 
 
+
+
+# ── Provider protocol blocks (openai / anthropic) ───────────────────
+
+_PROVIDER_BASE = """
+[upstreams.gpt55]
+model_id = "gpt-5.5"
+base_url = "https://api.openai.com/v1"
+context = 400000
+max_output = 16000
+modalities = ["text", "image"]
+[upstreams.gpt55.openai]
+reasoning_effort = "xhigh"
+max_tokens_param = "max_completion_tokens"
+drop_params = ["temperature", "top_p"]
+
+[upstreams.opus]
+model_id = "claude-opus-4-8"
+base_url = "https://api.anthropic.com/v1"
+context = 200000
+max_output = 32000
+modalities = ["text", "image"]
+protocol = "anthropic"
+api_key_env = "ANTHROPIC_KEY"
+[upstreams.opus.anthropic]
+thinking = "adaptive"
+effort = "xhigh"
+
+[profiles."moa.v1"]
+type = "moa"
+generators = ["gpt55", "opus"]
+synthesizer = "opus"
+non_client_synth_reserve_tokens = 8192
+"""
+
+
+def test_provider_blocks_parse() -> None:
+    cfg = parse_config_str(_PROVIDER_BASE)
+    gpt = cfg.upstreams["gpt55"]
+    assert gpt.protocol == "openai"
+    assert gpt.openai is not None
+    assert gpt.openai.reasoning_effort == "xhigh"
+    assert gpt.openai.max_tokens_param == "max_completion_tokens"
+    opus = cfg.upstreams["opus"]
+    assert opus.protocol == "anthropic"
+    assert opus.anthropic is not None
+    assert opus.anthropic.thinking == "adaptive"
+    assert opus.anthropic.effort == "xhigh"
+
+
+def test_default_protocol_is_openai_with_no_blocks() -> None:
+    cfg = parse_config_str(_MINIMAL_UPSTREAMS)
+    up = cfg.upstreams["text_a"]
+    assert up.protocol == "openai"
+    assert up.openai is None
+    assert up.anthropic is None
+
+
+def test_anthropic_block_on_openai_protocol_rejected() -> None:
+    toml = """
+[upstreams.bad]
+model_id = "x"
+base_url = "http://x"
+context = 8192
+max_output = 1024
+[upstreams.bad.anthropic]
+thinking = "adaptive"
+"""
+    with pytest.raises(ValidationError) as exc:
+        parse_config_str(toml)
+    assert "anthropic" in str(exc.value).lower()
+
+
+def test_openai_block_on_anthropic_protocol_rejected() -> None:
+    toml = """
+[upstreams.bad]
+model_id = "claude"
+base_url = "https://api.anthropic.com/v1"
+context = 8192
+max_output = 1024
+protocol = "anthropic"
+[upstreams.bad.openai]
+reasoning_effort = "high"
+"""
+    with pytest.raises(ValidationError) as exc:
+        parse_config_str(toml)
+    assert "openai" in str(exc.value).lower()
